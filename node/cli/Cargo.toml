@@ -1,0 +1,44 @@
+[package]
+name = " mrevm-cli"
+version = "0.11.2"
+authors = ["moonrabbit"]
+edition = "2018"
+
+[dependencies]
+log = "0.4.8"
+structopt = "0.3.8"
+parity-scale-codec = '2.0.0'
+
+sp-core = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sc-cli = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sc-service = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sc-tracing = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-runtime = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sc-telemetry = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+frame-benchmarking-cli = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+try-runtime-cli = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8", optional = true }
+
+cumulus-client-cli = { git = "https://github.com/moonrabbit/cumulus", branch = "joshy-np098" }
+cumulus-client-service = { git = "https://github.com/moonrabbit/cumulus", branch = "joshy-np098" }
+cumulus-primitives-core = { git = "https://github.com/moonrabbit/cumulus", branch = "joshy-np098" }
+nimbus-primitives = { git = "https://github.com/moonrabbit/cumulus", branch = "joshy-np098" }
+
+moonrabbit-jurisdiction = { git = "https://github.com/paritytech/moonrabbit", branch = "release-v0.9.8" }
+moonrabbit-service = { git = "https://github.com/paritytech/moonrabbit", branch = "release-v0.9.8" }
+moonrabbit-cli = { git = "https://github.com/paritytech/moonrabbit", branch = "release-v0.9.8" }
+moonrabbit-primitives = { git = "https://github.com/paritytech/moonrabbit", branch = "release-v0.9.8" }
+
+service = { package = " mrevm-service", path = "../service", default-features = false }
+cli-opt = { package = " mrevm-cli-opt", path = "../cli-opt", default-features = false }
+
+[build-dependencies]
+substrate-build-script-utils = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+
+[features]
+default = ["wasmtime"]
+wasmtime = ["sc-cli/wasmtime"]
+runtime-benchmarks = ["service/runtime-benchmarks"]
+try-runtime = [
+	"try-runtime-cli",
+	"service/try-runtime",
+]

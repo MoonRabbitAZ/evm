@@ -1,0 +1,22 @@
+# MacOS thing
+**/.DS_Store
+
+# Rust directories
+**/scripts/tmp
+.cargo/
+
+# Typescript directories
+**/node_modules
+**/.yarn
+
+# Spec/Wasm build directory
+
+# Generated test specs
+/tests/ mrevm-test-specs/*.json
+
+#  mrevm-Launch
+*.log
+tools/specFiles
+tools/*-local.json
+tools/*-local-raw.json
+tools/build

@@ -1,0 +1,27 @@
+[package]
+name = " mrevm-rpc-txpool"
+version = '0.6.0'
+authors = ['moonrabbit']
+edition = '2018'
+homepage = 'https:// mrevm.network'
+license = 'GPL-3.0-only'
+repository = 'https://github.com/moonrabbit/ mrevm/'
+
+[dependencies]
+rlp = "0.5"
+sha3 = "0.8"
+jsonrpc-core = "15.0.0"
+ethereum-types = "0.11.0"
+ mrevm-rpc-core-txpool = { path = "../../rpc-core/txpool" }
+sp-runtime = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-api = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-io = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-std = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-blockchain = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-transaction-pool = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sc-transaction-graph = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+frame-system = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+serde = { version = "1.0", features = ["derive"] }
+
+ mrevm-rpc-primitives-txpool = { path = "../../../primitives/rpc/txpool" }
+fc-rpc = { git = "https://github.com/moonrabbit/frontier", branch = "mrevm-phase-four", features = ["rpc_binary_search_estimate"] }

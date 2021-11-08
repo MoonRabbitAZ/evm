@@ -1,0 +1,39 @@
+[package]
+name = ' mrevm'
+description = ' mrevm Collator'
+homepage = 'https:// mrevm.network'
+license = 'GPL-3.0-only'
+version = '0.11.2'
+authors = ["moonrabbit"]
+edition = '2018'
+
+[[bin]]
+name = ' mrevm'
+path = 'src/main.rs'
+
+[dependencies]
+futures = { version = "0.3.1", features = ["compat"] }
+ mrevm-cli = { path = "cli" }
+ mrevm-service = { path = "service" }
+
+[dev-dependencies]
+serde = { version = "1.0.101", features = ["derive"] }
+serde_json = "1.0"
+assert_cmd = "0.12"
+nix = "0.17"
+tempfile = "3.2.0"
+hex = "0.4.3"
+# required for benchmarking
+pallet-xcm = { git = "https://github.com/paritytech/moonrabbit", branch = "release-v0.9.8" }
+xcm-builder = { git = "https://github.com/paritytech/moonrabbit", branch = "release-v0.9.8" }
+
+[features]
+default = []
+
+test-spec = []
+
+runtime-benchmarks = [
+	" mrevm-cli/runtime-benchmarks",
+	"pallet-xcm/runtime-benchmarks",
+	"xcm-builder/runtime-benchmarks",
+]

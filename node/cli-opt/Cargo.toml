@@ -1,0 +1,17 @@
+ [package]
+name = ' mrevm-cli-opt'
+homepage = 'https:// mrevm.network'
+license = 'GPL-3.0-only'
+version = '0.11.2'
+authors = ["moonrabbit"]
+edition = '2018'
+
+[dependencies]
+sp-runtime = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+structopt = "0.3.8"
+tiny-bip39 = { version = "0.6" }
+libsecp256k1 = { version = "0.3.2" }
+primitive-types = "0.9.0"
+sha3 = "0.8"
+tiny-hderive = "0.3.0"
+account = { path = "../../primitives/account" }

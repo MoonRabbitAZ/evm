@@ -1,0 +1,22 @@
+[package]
+name = " mrevm-rpc-core-debug"
+version = '0.1.0'
+authors = ['moonrabbit']
+edition = '2018'
+homepage = 'https:// mrevm.network'
+license = 'GPL-3.0-only'
+repository = 'https://github.com/moonrabbit/ mrevm/'
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = { version = "0.3", features = ["compat"] }
+ethereum-types = "0.11.0"
+jsonrpc-core = "15.0.0"
+jsonrpc-core-client = "14.0.3"
+jsonrpc-derive = "14.0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sp-core = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+ mrevm-rpc-primitives-debug = { path = "../../../primitives/rpc/debug" }
+#evm = { version = "0.20.0", default-features = false, features = ["with-codec"] }

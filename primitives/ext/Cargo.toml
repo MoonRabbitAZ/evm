@@ -1,0 +1,29 @@
+[package]
+name = " mrevm-primitives-ext"
+version = '0.1.0'
+authors = ['moonrabbit']
+edition = '2018'
+homepage = 'https:// mrevm.network'
+license = 'GPL-3.0-only'
+repository = 'https://github.com/moonrabbit/ mrevm/'
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+codec = { package = "parity-scale-codec", version = "2.0.0", default-features = false }
+ethereum-types = { version = "0.11.0", default-features = false }
+ mrevm-rpc-primitives-debug = { path = "../rpc/debug", default-features = false }
+sp-runtime-interface = { git = "https://github.com/paritytech/substrate.git", branch = "moonrabbit-v0.9.8", default-features = false }
+sp-externalities = { git = "https://github.com/paritytech/substrate.git", branch = "moonrabbit-v0.9.8", default-features = false }
+sp-std = { git = "https://github.com/paritytech/substrate.git", branch = "moonrabbit-v0.9.8", default-features = false }
+
+[features]
+default = ["std"]
+std = [
+	"codec/std",
+	"ethereum-types/std",
+	" mrevm-rpc-primitives-debug/std",
+	"sp-runtime-interface/std",
+	"sp-externalities/std",
+	"sp-std/std",
+]

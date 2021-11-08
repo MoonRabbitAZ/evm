@@ -1,0 +1,42 @@
+[package]
+name = " mrevm-rpc-trace"
+version = '0.6.0'
+authors = ['moonrabbit']
+edition = '2018'
+homepage = 'https:// mrevm.network'
+license = 'GPL-3.0-only'
+repository = 'https://github.com/moonrabbit/ mrevm/'
+
+[dependencies]
+# Utils
+serde = { version = "1.0", features = ["derive"] }
+sha3 = "0.8"
+ethereum-types = "0.11.0"
+ethereum = { version = "0.7.1", features = ["with-codec"] }
+
+# Async and logs
+tokio = { version = "0.2.13", features = ["sync", "time"] }
+futures = { version = "0.3", features = ["compat"] }
+tracing = "0.1.25"
+
+# Primitives
+sp-runtime = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-utils = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-api = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-io = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-std = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-blockchain = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-transaction-pool = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sp-block-builder = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+fp-rpc = { git = "https://github.com/moonrabbit/frontier", branch = "mrevm-phase-four" }
+ mrevm-rpc-primitives-debug = { path = "../../../primitives/rpc/debug" }
+
+# Client and RPC
+jsonrpc-core = "15.0.0"
+sc-client-api = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sc-network = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+sc-transaction-graph = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8" }
+fc-rpc = { git = "https://github.com/moonrabbit/frontier", branch = "mrevm-phase-four", features = ["rpc_binary_search_estimate"] }
+fc-consensus = { git = "https://github.com/moonrabbit/frontier", branch = "mrevm-phase-four" }
+fc-rpc-core = { git = "https://github.com/moonrabbit/frontier", branch = "mrevm-phase-four" }
+ mrevm-rpc-core-trace = { path = "../../rpc-core/trace" }

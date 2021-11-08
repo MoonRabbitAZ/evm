@@ -1,0 +1,417 @@
+
+
+#[macro_export]
+macro_rules! impl_runtime_apis_plus_common {
+	{$($custom:tt)*} => {
+		impl_runtime_apis! {
+			$($custom)*
+
+			impl sp_api::Core<Block> for Runtime {
+				fn version() -> RuntimeVersion {
+					VERSION
+				}
+
+				fn execute_block(block: Block) {
+					Executive::execute_block(block)
+				}
+
+				fn initialize_block(header: &<Block as BlockT>::Header) {
+					Executive::initialize_block(header)
+				}
+			}
+
+			impl sp_api::Metadata<Block> for Runtime {
+				fn metadata() -> OpaqueMetadata {
+					Runtime::metadata().into()
+				}
+			}
+
+			impl sp_block_builder::BlockBuilder<Block> for Runtime {
+				fn apply_extrinsic(extrinsic: <Block as BlockT>::Extrinsic) -> ApplyExtrinsicResult {
+					Executive::apply_extrinsic(extrinsic)
+				}
+
+				fn finalize_block() -> <Block as BlockT>::Header {
+					Executive::finalize_block()
+				}
+
+				fn inherent_extrinsics(
+					data: sp_inherents::InherentData,
+				) -> Vec<<Block as BlockT>::Extrinsic> {
+					data.create_extrinsics()
+				}
+
+				fn check_inherents(
+					block: Block,
+					data: sp_inherents::InherentData,
+				) -> sp_inherents::CheckInherentsResult {
+					data.check_extrinsics(&block)
+				}
+			}
+
+			impl sp_offchain::OffchainWorkerApi<Block> for Runtime {
+				fn offchain_worker(header: &<Block as BlockT>::Header) {
+					Executive::offchain_worker(header)
+				}
+			}
+
+			impl sp_session::SessionKeys<Block> for Runtime {
+				fn decode_session_keys(
+					encoded: Vec<u8>,
+				) -> Option<Vec<(Vec<u8>, sp_core::crypto::KeyTypeId)>> {
+					opaque::SessionKeys::decode_into_raw_public_keys(&encoded)
+				}
+
+				fn generate_session_keys(seed: Option<Vec<u8>>) -> Vec<u8> {
+					opaque::SessionKeys::generate(seed)
+				}
+			}
+
+			impl frame_system_rpc_runtime_api::AccountNonceApi<Block, AccountId, Index> for Runtime {
+				fn account_nonce(account: AccountId) -> Index {
+					System::account_nonce(account)
+				}
+			}
+
+			impl  mrevm_rpc_primitives_debug::DebugRuntimeApi<Block> for Runtime {
+				fn trace_transaction(
+					header: &<Block as BlockT>::Header,
+					extrinsics: Vec<<Block as BlockT>::Extrinsic>,
+					transaction: &EthereumTransaction,
+				) -> Result<
+					(),
+					sp_runtime::DispatchError,
+				> {
+					use  mrevm_evm_tracer::EvmTracer;
+
+					// Explicit initialize.
+					// Needed because https://github.com/paritytech/substrate/pull/8953
+					Executive::initialize_block(header);
+
+					// Apply the a subset of extrinsics: all the substrate-specific or ethereum
+					// transactions that preceded the requested transaction.
+					for ext in extrinsics.into_iter() {
+						let _ = match &ext.function {
+							Call::Ethereum(transact(t)) => {
+								if t == transaction {
+									EvmTracer::new().trace(|| Executive::apply_extrinsic(ext));
+									return Ok(());
+								} else {
+									Executive::apply_extrinsic(ext)
+								}
+							}
+							_ => Executive::apply_extrinsic(ext),
+						};
+					}
+
+					Err(sp_runtime::DispatchError::Other(
+						"Failed to find Ethereum transaction among the extrinsics.",
+					))
+				}
+
+				fn trace_block(
+					header: &<Block as BlockT>::Header,
+					extrinsics: Vec<<Block as BlockT>::Extrinsic>,
+				) -> Result<
+					(),
+					sp_runtime::DispatchError,
+				> {
+					use  mrevm_evm_tracer::EvmTracer;
+					// Explicit initialize.
+					// Needed because https://github.com/paritytech/substrate/pull/8953
+					Executive::initialize_block(header);
+
+					let mut config = <Runtime as pallet_evm::Config>::config().clone();
+					config.estimate = true;
+
+					// Apply all extrinsics. Ethereum extrinsics are traced.
+					for ext in extrinsics.into_iter() {
+						match &ext.function {
+							Call::Ethereum(transact(_transaction)) => {
+								// Each extrinsic is a new call stack.
+								EvmTracer::emit_new();
+								EvmTracer::new().trace(|| Executive::apply_extrinsic(ext));
+							}
+							_ => {
+								let _ = Executive::apply_extrinsic(ext);
+							}
+						};
+					}
+
+					Ok(())
+				}
+			}
+
+			impl  mrevm_rpc_primitives_txpool::TxPoolRuntimeApi<Block> for Runtime {
+				fn extrinsic_filter(
+					xts_ready: Vec<<Block as BlockT>::Extrinsic>,
+					xts_future: Vec<<Block as BlockT>::Extrinsic>,
+				) -> TxPoolResponse {
+					TxPoolResponse {
+						ready: xts_ready
+							.into_iter()
+							.filter_map(|xt| match xt.function {
+								Call::Ethereum(transact(t)) => Some(t),
+								_ => None,
+							})
+							.collect(),
+						future: xts_future
+							.into_iter()
+							.filter_map(|xt| match xt.function {
+								Call::Ethereum(transact(t)) => Some(t),
+								_ => None,
+							})
+							.collect(),
+					}
+				}
+			}
+
+			impl fp_rpc::EthereumRuntimeRPCApi<Block> for Runtime {
+				fn chain_id() -> u64 {
+					<Runtime as pallet_evm::Config>::ChainId::get()
+				}
+
+				fn account_basic(address: H160) -> EVMAccount {
+					EVM::account_basic(&address)
+				}
+
+				fn gas_price() -> U256 {
+					<Runtime as pallet_evm::Config>::FeeCalculator::min_gas_price()
+				}
+
+				fn account_code_at(address: H160) -> Vec<u8> {
+					EVM::account_codes(address)
+				}
+
+				fn author() -> H160 {
+					<pallet_evm::Module<Runtime>>::find_author()
+				}
+
+				fn storage_at(address: H160, index: U256) -> H256 {
+					let mut tmp = [0u8; 32];
+					index.to_big_endian(&mut tmp);
+					EVM::account_storages(address, H256::from_slice(&tmp[..]))
+				}
+
+				fn call(
+					from: H160,
+					to: H160,
+					data: Vec<u8>,
+					value: U256,
+					gas_limit: U256,
+					gas_price: Option<U256>,
+					nonce: Option<U256>,
+					estimate: bool,
+				) -> Result<pallet_evm::CallInfo, sp_runtime::DispatchError> {
+					let config = if estimate {
+						let mut config = <Runtime as pallet_evm::Config>::config().clone();
+						config.estimate = true;
+						Some(config)
+					} else {
+						None
+					};
+
+					<Runtime as pallet_evm::Config>::Runner::call(
+						from,
+						to,
+						data,
+						value,
+						gas_limit.low_u64(),
+						gas_price,
+						nonce,
+						config
+							.as_ref()
+							.unwrap_or_else(|| <Runtime as pallet_evm::Config>::config()),
+					)
+					.map_err(|err| err.into())
+				}
+
+				fn create(
+					from: H160,
+					data: Vec<u8>,
+					value: U256,
+					gas_limit: U256,
+					gas_price: Option<U256>,
+					nonce: Option<U256>,
+					estimate: bool,
+				) -> Result<pallet_evm::CreateInfo, sp_runtime::DispatchError> {
+					let config = if estimate {
+						let mut config = <Runtime as pallet_evm::Config>::config().clone();
+						config.estimate = true;
+						Some(config)
+					} else {
+						None
+					};
+
+					#[allow(clippy::or_fun_call)] // suggestion not helpful here
+					<Runtime as pallet_evm::Config>::Runner::create(
+						from,
+						data,
+						value,
+						gas_limit.low_u64(),
+						gas_price,
+						nonce,
+						config
+							.as_ref()
+							.unwrap_or(<Runtime as pallet_evm::Config>::config()),
+					)
+					.map_err(|err| err.into())
+				}
+
+				fn current_transaction_statuses() -> Option<Vec<TransactionStatus>> {
+					Ethereum::current_transaction_statuses()
+				}
+
+				fn current_block() -> Option<pallet_ethereum::Block> {
+					Ethereum::current_block()
+				}
+
+				fn current_receipts() -> Option<Vec<pallet_ethereum::Receipt>> {
+					Ethereum::current_receipts()
+				}
+
+				fn current_all() -> (
+					Option<pallet_ethereum::Block>,
+					Option<Vec<pallet_ethereum::Receipt>>,
+					Option<Vec<TransactionStatus>>,
+				) {
+					(
+						Ethereum::current_block(),
+						Ethereum::current_receipts(),
+						Ethereum::current_transaction_statuses(),
+					)
+				}
+
+				fn extrinsic_filter(
+					xts: Vec<<Block as BlockT>::Extrinsic>,
+				) -> Vec<EthereumTransaction> {
+					xts.into_iter().filter_map(|xt| match xt.function {
+						Call::Ethereum(transact(t)) => Some(t),
+						_ => None
+					}).collect::<Vec<EthereumTransaction>>()
+				}
+			}
+
+			impl pallet_transaction_payment_rpc_runtime_api::TransactionPaymentApi<Block, Balance>
+			for Runtime {
+				fn query_info(
+					uxt: <Block as BlockT>::Extrinsic,
+					len: u32,
+				) -> pallet_transaction_payment_rpc_runtime_api::RuntimeDispatchInfo<Balance> {
+					TransactionPayment::query_info(uxt, len)
+				}
+
+				fn query_fee_details(
+					uxt: <Block as BlockT>::Extrinsic,
+					len: u32,
+				) -> pallet_transaction_payment::FeeDetails<Balance> {
+					TransactionPayment::query_fee_details(uxt, len)
+				}
+			}
+
+			impl nimbus_primitives::AuthorFilterAPI<Block, nimbus_primitives::NimbusId> for Runtime {
+				fn can_author(
+					author: nimbus_primitives::NimbusId,
+					slot: u32,
+					parent_header: &<Block as BlockT>::Header
+				) -> bool {
+					let block_number = parent_header.number + 1;
+
+					// The  mrevm runtimes use an entropy source that needs to do some accounting
+					// work during block initialization. Therefore we initialize it here to match
+					// the state it will be in when the next block is being executed.
+					use frame_support::traits::OnInitialize;
+					System::initialize(
+						&block_number,
+						&parent_header.hash(),
+						&parent_header.digest,
+						frame_system::InitKind::Inspection
+					);
+					RandomnessCollectiveFlip::on_initialize(block_number);
+
+					// Because the staking solution calculates the next staking set at the beginning
+					// of the first block in the new round, the only way to accurately predict the
+					// authors would be to run the staking election while predicting. However this
+					// election is heavy and will take too long during prediction. So instead we
+					// work around it by always authoring the first slot in a new round. A longer-
+					// term solution will be to calculate the staking election result in the last
+					// block of the ending round.
+					if jurisdiction_staking::Pallet::<Self>::round().should_update(block_number) {
+						log::info!(target: "nimbus-staking-workaround", "A new round is starting.\
+						 mrevm will author during this slot without predicting eligibility first.\
+						You may see a `CannotBeAuthor` error soon. This is expected and harmless.\
+						It will be resolved soon.");
+
+						true
+					}
+					else {
+						AuthorInherent::can_author(&author, &slot)
+
+					}
+				}
+			}
+
+			impl cumulus_primitives_core::CollectCollationInfo<Block> for Runtime {
+				fn collect_collation_info() -> cumulus_primitives_core::CollationInfo {
+					JurisdictionSystem::collect_collation_info()
+				}
+			}
+
+			#[cfg(feature = "runtime-benchmarks")]
+			impl frame_benchmarking::Benchmark<Block> for Runtime {
+				fn dispatch_benchmark(
+					config: frame_benchmarking::BenchmarkConfig,
+				) -> Result<Vec<frame_benchmarking::BenchmarkBatch>, sp_runtime::RuntimeString> {
+					use frame_benchmarking::{
+						add_benchmark, BenchmarkBatch, Benchmarking, TrackedStorageKey,
+					};
+
+					use frame_system_benchmarking::Pallet as SystemBench;
+					impl frame_system_benchmarking::Config for Runtime {}
+
+					use pallet_crowdloan_rewards::Pallet as PalletCrowdloanRewardsBench;
+					use jurisdiction_staking::Pallet as JurisdictionStakingBench;
+					use pallet_author_mapping::Pallet as PalletAuthorMappingBench;
+					let whitelist: Vec<TrackedStorageKey> = vec![];
+
+					let mut batches = Vec::<BenchmarkBatch>::new();
+					let params = (&config, &whitelist);
+
+					add_benchmark!(
+						params,
+						batches,
+						jurisdiction_staking,
+						JurisdictionStakingBench::<Runtime>
+					);
+					add_benchmark!(
+					params,
+						batches,
+						pallet_crowdloan_rewards,
+						PalletCrowdloanRewardsBench::<Runtime>
+					);
+					add_benchmark!(
+						params,
+						batches,
+						pallet_author_mapping,
+						PalletAuthorMappingBench::<Runtime>
+					);
+					add_benchmark!(params, batches, frame_system, SystemBench::<Runtime>);
+
+					if batches.is_empty() {
+						return Err("Benchmark not found for this pallet.".into());
+					}
+					Ok(batches)
+				}
+			}
+
+			#[cfg(feature = "try-runtime")]
+			impl frame_try_runtime::TryRuntime<Block> for Runtime {
+				fn on_runtime_upgrade() -> Result<(Weight, Weight), sp_runtime::RuntimeString> {
+					log::info!("try-runtime::on_runtime_upgrade()");
+					let weight = Executive::try_runtime_upgrade()?;
+					Ok((weight, BlockWeights::get().max_block))
+				}
+			}
+		}
+	};
+}

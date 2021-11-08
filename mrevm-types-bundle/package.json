@@ -1,0 +1,31 @@
+{
+  "name": " mrevm-types-bundle",
+  "version": "1.1.27",
+  "description": "Bundled types to instantiate the moonrabbit JS api with a mrevm network",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "prepublish": "tsc",
+  "scripts": {
+    "build": "tsc",
+    "publish-package": "tsc && npm publish",
+    "lint": "npx prettier --write --ignore-path .gitignore '**/*.(yml|js|ts|json)'"
+  },
+  "keywords": [
+    "mrevm",
+    "types",
+    "bundle",
+    "moonrabbit",
+    "api"
+  ],
+  "author": "Moon Rabbit",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moonrabbit/mrevm.git"
+  },
+  "dependencies": {
+    "@moonrabbit/keyring": "^7.0.3",
+    "@moonrabbit/types": "^5.2.1",
+    "typescript": "^4.3.5"
+  }
+}

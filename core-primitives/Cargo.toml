@@ -1,0 +1,21 @@
+[package]
+authors = ['moonrabbit']
+edition = '2018'
+homepage = 'https:// mrevm.network'
+license = 'GPL-3.0-only'
+name = ' mrevm-core-primitives'
+repository = 'https://github.com/moonrabbit/ mrevm/'
+version = '0.1.1'
+
+[dependencies]
+sp-core = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8", default-features = false }
+sp-runtime = { git = "https://github.com/paritytech/substrate", branch = "moonrabbit-v0.9.8", default-features = false }
+account = { path = "../primitives/account", default-features = false }
+
+[features]
+default = [ "std" ]
+std = [
+	"sp-core/std",
+	"sp-runtime/std",
+	"account/std",
+]
