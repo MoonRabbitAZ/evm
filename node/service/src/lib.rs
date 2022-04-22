@@ -1,283 +1,421 @@
+#![deny(unused_results)]
 
-
-//! This module assembles the  mrevm service components, executes them, and manages communication
-//! between them. This is the backbone of the client-side node implementation.
-//!
-//! This module can assemble:
-//! PartialComponents: For maintence tasks without a complete node (eg import/export blocks, purge)
-//! Full Service: A complete jurisdiction node including the pool, rpc, network, embedded relay chain
-//! Dev Service: A leaner service without the relay chain backing.
-
-use cli_opt::RpcConfig;
-use fc_consensus::FrontierBlockImport;
-use fc_rpc_core::types::{FilterPool, PendingTransactions};
-use futures::StreamExt;
-pub use moonbase_runtime;
-pub use  mrevm_runtime;
-pub use mrevm_runtime;
-use sc_service::BasePath;
-use std::{
-	collections::{BTreeMap, HashMap},
-	sync::Mutex,
-	time::Duration,
-};
-mod inherents;
-mod rpc;
-use cumulus_client_network::build_block_announce_validator;
-use cumulus_client_service::{
-	prepare_node_config, start_collator, start_full_node, StartCollatorParams, StartFullNodeParams,
-};
-use nimbus_consensus::{build_nimbus_consensus, BuildNimbusConsensusParams};
-use nimbus_primitives::NimbusId;
-
-pub use sc_executor::NativeExecutor;
-use sc_executor::{native_executor_instance, NativeExecutionDispatch};
-use sc_service::{
-	error::Error as ServiceError, ChainSpec, Configuration, PartialComponents, Role, TFullBackend,
-	TFullClient, TaskManager,
-};
-use sp_api::ConstructRuntimeApi;
-use sp_blockchain::HeaderBackend;
-use std::sync::Arc;
-
-pub use client::*;
 pub mod chain_spec;
-mod client;
+mod grandpa_support;
+mod parachains_db;
+mod relay_chain_selection;
 
-use sc_telemetry::{Telemetry, TelemetryWorker, TelemetryWorkerHandle};
+#[cfg(feature = "full-node")]
+pub mod overseer;
 
-type FullClient<RuntimeApi, Executor> = TFullClient<Block, RuntimeApi, Executor>;
-type FullBackend = TFullBackend<Block>;
-type MaybeSelectChain = Option<sc_consensus::LongestChain<FullBackend, Block>>;
+#[cfg(feature = "full-node")]
+pub use self::overseer::{OverseerGen, OverseerGenArgs, RealOverseerGen};
 
-native_executor_instance!(
-	pub  mrevmExecutor,
-	 mrevm_runtime::api::dispatch,
-	 mrevm_runtime::native_version,
-	(
-		frame_benchmarking::benchmarking::HostFunctions,
-		 mrevm_primitives_ext:: mrevm_ext::HostFunctions
-	),
-);
+#[cfg(test)]
+mod tests;
 
-native_executor_instance!(
-	pub mrevmExecutor,
-	mrevm_runtime::api::dispatch,
-	mrevm_runtime::native_version,
-	(
-		frame_benchmarking::benchmarking::HostFunctions,
-		 mrevm_primitives_ext:: mrevm_ext::HostFunctions
-	),
-);
+#[cfg(feature = "full-node")]
+use {
+	beefy_gadget::notification::{BeefyBestBlockSender, BeefySignedCommitmentSender},
+	grandpa::{self, FinalityProofProvider as GrandpaFinalityProofProvider},
+	gum::info,
+	moonrabbit_node_core_approval_voting::Config as ApprovalVotingConfig,
+	moonrabbit_node_core_av_store::Config as AvailabilityConfig,
+	moonrabbit_node_core_av_store::Error as AvailabilityError,
+	moonrabbit_node_core_candidate_validation::Config as CandidateValidationConfig,
+	moonrabbit_node_core_chain_selection::{
+		self as chain_selection_subsystem, Config as ChainSelectionConfig,
+	},
+	moonrabbit_node_core_dispute_coordinator::Config as DisputeCoordinatorConfig,
+	moonrabbit_overseer::BlockInfo,
+	sc_client_api::{BlockBackend, ExecutorProvider},
+	sp_trie::PrefixedMemoryDB,
+};
 
-native_executor_instance!(
-	pub MoonbaseExecutor,
-	moonbase_runtime::api::dispatch,
-	moonbase_runtime::native_version,
-	(
-		frame_benchmarking::benchmarking::HostFunctions,
-		 mrevm_primitives_ext:: mrevm_ext::HostFunctions
-	),
-);
+pub use sp_core::traits::SpawnNamed;
+#[cfg(feature = "full-node")]
+pub use {
+	moonrabbit_overseer::{Handle, Overseer, OverseerConnector, OverseerHandle},
+	moonrabbit_primitives::runtime_api::ParachainHost,
+	relay_chain_selection::SelectRelayChain,
+	sc_client_api::AuxStore,
+	sp_authority_discovery::AuthorityDiscoveryApi,
+	sp_blockchain::HeaderBackend,
+	sp_consensus_babe::BabeApi,
+};
 
-/// Can be called for a `Configuration` to check if it is a configuration for
-/// the ` mrevm` network.
+#[cfg(feature = "full-node")]
+use moonrabbit_subsystem::jaeger;
+
+use std::{sync::Arc, time::Duration};
+
+use prometheus_endpoint::Registry;
+#[cfg(feature = "full-node")]
+use service::KeystoreContainer;
+use service::RpcHandlers;
+use telemetry::TelemetryWorker;
+#[cfg(feature = "full-node")]
+use telemetry::{Telemetry, TelemetryWorkerHandle};
+
+#[cfg(feature = "rococo-native")]
+pub use moonrabbit_client::RococoExecutorDispatch;
+
+#[cfg(feature = "westend-native")]
+pub use moonrabbit_client::WestendExecutorDispatch;
+
+#[cfg(feature = "kusama-native")]
+pub use moonrabbit_client::KusamaExecutorDispatch;
+
+#[cfg(feature = "moonrabbit-native")]
+pub use moonrabbit_client::moonrabbitExecutorDispatch;
+
+pub use chain_spec::{KusamaChainSpec, moonrabbitChainSpec, RococoChainSpec, WestendChainSpec};
+pub use consensus_common::{block_validation::Chain, Proposal, SelectChain};
+#[cfg(feature = "full-node")]
+pub use moonrabbit_client::{
+	AbstractClient, Client, ClientHandle, ExecuteWithClient, FullBackend, FullClient,
+	RuntimeApiCollection,
+};
+pub use moonrabbit_primitives::v2::{Block, BlockId, CollatorPair, Hash, Id as ParaId};
+pub use sc_client_api::{Backend, CallExecutor, ExecutionStrategy};
+pub use sc_consensus::{BlockImport, LongestChain};
+use sc_executor::NativeElseWasmExecutor;
+pub use sc_executor::NativeExecutionDispatch;
+pub use service::{
+	config::{DatabaseSource, PrometheusConfig},
+	ChainSpec, Configuration, Error as SubstrateServiceError, PruningMode, Role, RuntimeGenesis,
+	TFullBackend, TFullCallExecutor, TFullClient, TaskManager, TransactionPoolOptions,
+};
+pub use sp_api::{ApiRef, ConstructRuntimeApi, Core as CoreApi, ProvideRuntimeApi, StateBackend};
+pub use sp_runtime::{
+	generic,
+	traits::{
+		self as runtime_traits, BlakeTwo256, Block as BlockT, HashFor, Header as HeaderT, NumberFor,
+	},
+};
+
+#[cfg(feature = "kusama-native")]
+pub use kusama_runtime;
+#[cfg(feature = "moonrabbit-native")]
+pub use moonrabbit_runtime;
+#[cfg(feature = "rococo-native")]
+pub use rococo_runtime;
+#[cfg(feature = "westend-native")]
+pub use westend_runtime;
+
+/// The maximum number of active leaves we forward to the [`Overseer`] on startup.
+#[cfg(any(test, feature = "full-node"))]
+const MAX_ACTIVE_LEAVES: usize = 4;
+
+/// Provides the header and block number for a hash.
+///
+/// Decouples `sc_client_api::Backend` and `sp_blockchain::HeaderBackend`.
+pub trait HeaderProvider<Block, Error = sp_blockchain::Error>: Send + Sync + 'static
+	where
+		Block: BlockT,
+		Error: std::fmt::Debug + Send + Sync + 'static,
+{
+	/// Obtain the header for a hash.
+	fn header(
+		&self,
+		hash: <Block as BlockT>::Hash,
+	) -> Result<Option<<Block as BlockT>::Header>, Error>;
+	/// Obtain the block number for a hash.
+	fn number(
+		&self,
+		hash: <Block as BlockT>::Hash,
+	) -> Result<Option<<<Block as BlockT>::Header as HeaderT>::Number>, Error>;
+}
+
+impl<Block, T> HeaderProvider<Block> for T
+	where
+		Block: BlockT,
+		T: sp_blockchain::HeaderBackend<Block> + 'static,
+{
+	fn header(
+		&self,
+		hash: Block::Hash,
+	) -> sp_blockchain::Result<Option<<Block as BlockT>::Header>> {
+		<Self as sp_blockchain::HeaderBackend<Block>>::header(
+			self,
+			generic::BlockId::<Block>::Hash(hash),
+		)
+	}
+	fn number(
+		&self,
+		hash: Block::Hash,
+	) -> sp_blockchain::Result<Option<<<Block as BlockT>::Header as HeaderT>::Number>> {
+		<Self as sp_blockchain::HeaderBackend<Block>>::number(self, hash)
+	}
+}
+
+/// Decoupling the provider.
+///
+/// Mandated since `trait HeaderProvider` can only be
+/// implemented once for a generic `T`.
+pub trait HeaderProviderProvider<Block>: Send + Sync + 'static
+	where
+		Block: BlockT,
+{
+	type Provider: HeaderProvider<Block> + 'static;
+
+	fn header_provider(&self) -> &Self::Provider;
+}
+
+impl<Block, T> HeaderProviderProvider<Block> for T
+	where
+		Block: BlockT,
+		T: sc_client_api::Backend<Block> + 'static,
+{
+	type Provider = <T as sc_client_api::Backend<Block>>::Blockchain;
+
+	fn header_provider(&self) -> &Self::Provider {
+		self.blockchain()
+	}
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+	#[error(transparent)]
+	Io(#[from] std::io::Error),
+
+	#[error(transparent)]
+	AddrFormatInvalid(#[from] std::net::AddrParseError),
+
+	#[error(transparent)]
+	Sub(#[from] SubstrateServiceError),
+
+	#[error(transparent)]
+	Blockchain(#[from] sp_blockchain::Error),
+
+	#[error(transparent)]
+	Consensus(#[from] consensus_common::Error),
+
+	#[error("Failed to create an overseer")]
+	Overseer(#[from] moonrabbit_overseer::SubsystemError),
+
+	#[error(transparent)]
+	Prometheus(#[from] prometheus_endpoint::PrometheusError),
+
+	#[error(transparent)]
+	Telemetry(#[from] telemetry::Error),
+
+	#[error(transparent)]
+	Jaeger(#[from] moonrabbit_subsystem::jaeger::JaegerError),
+
+	#[cfg(feature = "full-node")]
+	#[error(transparent)]
+	Availability(#[from] AvailabilityError),
+
+	#[error("Authorities require the real overseer implementation")]
+	AuthoritiesRequireRealOverseer,
+
+	#[cfg(feature = "full-node")]
+	#[error("Creating a custom database is required for validators")]
+	DatabasePathRequired,
+
+	#[cfg(feature = "full-node")]
+	#[error("Expected at least one of moonrabbit, kusama, westend or rococo runtime feature")]
+	NoRuntime,
+}
+
+/// Can be called for a `Configuration` to identify which network the configuration targets.
 pub trait IdentifyVariant {
-	/// Returns `true` if this is a configuration for the `Moonbase` network.
-	fn is_moonbase(&self) -> bool;
+	/// Returns if this is a configuration for the `Kusama` network.
+	fn is_kusama(&self) -> bool;
 
-	/// Returns `true` if this is a configuration for the ` mrevm` network.
-	fn is_ mrevm(&self) -> bool;
+	/// Returns if this is a configuration for the `Westend` network.
+	fn is_westend(&self) -> bool;
 
-	/// Returns `true` if this is a configuration for the `mrevm` network.
-	fn is_mrevm(&self) -> bool;
+	/// Returns if this is a configuration for the `Rococo` network.
+	fn is_rococo(&self) -> bool;
 
-	/// Returns `true` if this is a configuration for a dev network.
+	/// Returns if this is a configuration for the `Wococo` test network.
+	fn is_wococo(&self) -> bool;
+
+	/// Returns if this is a configuration for the `Versi` test network.
+	fn is_versi(&self) -> bool;
+
+	/// Returns true if this configuration is for a development network.
 	fn is_dev(&self) -> bool;
 }
 
 impl IdentifyVariant for Box<dyn ChainSpec> {
-	fn is_moonbase(&self) -> bool {
-		self.id().starts_with("moonbase")
+	fn is_kusama(&self) -> bool {
+		self.id().starts_with("kusama") || self.id().starts_with("ksm")
 	}
-
-	fn is_ mrevm(&self) -> bool {
-		self.id().starts_with(" mrevm")
+	fn is_westend(&self) -> bool {
+		self.id().starts_with("westend") || self.id().starts_with("wnd")
 	}
-
-	fn is_mrevm(&self) -> bool {
-		self.id().starts_with("mrevm")
+	fn is_rococo(&self) -> bool {
+		self.id().starts_with("rococo") || self.id().starts_with("rco")
 	}
-
+	fn is_wococo(&self) -> bool {
+		self.id().starts_with("wococo") || self.id().starts_with("wco")
+	}
+	fn is_versi(&self) -> bool {
+		self.id().starts_with("versi") || self.id().starts_with("vrs")
+	}
 	fn is_dev(&self) -> bool {
 		self.id().ends_with("dev")
 	}
 }
 
-pub fn frontier_database_dir(config: &Configuration) -> std::path::PathBuf {
-	let config_dir = config
-		.base_path
-		.as_ref()
-		.map(|base_path| base_path.config_dir(config.chain_spec.id()))
-		.unwrap_or_else(|| {
-			BasePath::from_project("", "", " mrevm").config_dir(config.chain_spec.id())
-		});
-	config_dir.join("frontier").join("db")
-}
-
-// TODO This is copied from frontier. It should be imported instead after
-// https://github.com/paritytech/frontier/issues/333 is solved
-pub fn open_frontier_backend(config: &Configuration) -> Result<Arc<fc_db::Backend<Block>>, String> {
-	Ok(Arc::new(fc_db::Backend::<Block>::new(
-		&fc_db::DatabaseSettings {
-			source: fc_db::DatabaseSettingsSrc::RocksDb {
-				path: frontier_database_dir(&config),
-				cache_size: 0,
-			},
-		},
-	)?))
-}
-
-use sp_runtime::traits::BlakeTwo256;
-use sp_trie::PrefixedMemoryDB;
-
-/// Builds a new object suitable for chain operations.
-#[allow(clippy::type_complexity)]
-pub fn new_chain_ops(
-	mut config: &mut Configuration,
-) -> Result<
-	(
-		Arc<Client>,
-		Arc<FullBackend>,
-		sp_consensus::import_queue::BasicQueue<Block, PrefixedMemoryDB<BlakeTwo256>>,
-		TaskManager,
-	),
-	ServiceError,
-> {
-	config.keystore = sc_service::config::KeystoreConfig::InMemory;
-	if config.chain_spec.is_moonbase() {
-		let PartialComponents {
-			client,
-			backend,
-			import_queue,
-			task_manager,
-			..
-		} = new_partial::<moonbase_runtime::RuntimeApi, MoonbaseExecutor>(
-			config,
-			config.chain_spec.is_dev(),
-		)?;
-		Ok((
-			Arc::new(Client::Moonbase(client)),
-			backend,
-			import_queue,
-			task_manager,
-		))
-	} else if config.chain_spec.is_mrevm() {
-		let PartialComponents {
-			client,
-			backend,
-			import_queue,
-			task_manager,
-			..
-		} = new_partial::<mrevm_runtime::RuntimeApi, mrevmExecutor>(
-			config,
-			config.chain_spec.is_dev(),
-		)?;
-		Ok((
-			Arc::new(Client::mrevm(client)),
-			backend,
-			import_queue,
-			task_manager,
-		))
-	} else {
-		let PartialComponents {
-			client,
-			backend,
-			import_queue,
-			task_manager,
-			..
-		} = new_partial::< mrevm_runtime::RuntimeApi,  mrevmExecutor>(
-			config,
-			config.chain_spec.is_dev(),
-		)?;
-		Ok((
-			Arc::new(Client:: mrevm(client)),
-			backend,
-			import_queue,
-			task_manager,
-		))
-	}
-}
-
-/// Builds the PartialComponents for a jurisdiction or development service
-///
-/// Use this function if you don't actually need the full service, but just the partial in order to
-/// be able to perform chain operations.
-#[allow(clippy::type_complexity)]
-pub fn new_partial<RuntimeApi, Executor>(
+/// Initialize the `Jeager` collector. The destination must listen
+/// on the given address and port for `UDP` packets.
+#[cfg(any(test, feature = "full-node"))]
+fn jaeger_launch_collector_with_agent(
+	spawner: impl SpawnNamed,
 	config: &Configuration,
-	dev_service: bool,
-) -> Result<
-	PartialComponents<
-		TFullClient<Block, RuntimeApi, Executor>,
-		FullBackend,
-		MaybeSelectChain,
-		sp_consensus::DefaultImportQueue<Block, TFullClient<Block, RuntimeApi, Executor>>,
-		sc_transaction_pool::FullPool<Block, FullClient<RuntimeApi, Executor>>,
-		(
-			FrontierBlockImport<
-				Block,
-				Arc<TFullClient<Block, RuntimeApi, Executor>>,
-				TFullClient<Block, RuntimeApi, Executor>,
-			>,
-			PendingTransactions,
-			Option<FilterPool>,
-			Option<Telemetry>,
-			Option<TelemetryWorkerHandle>,
-			Arc<fc_db::Backend<Block>>,
-		),
-	>,
-	ServiceError,
->
-where
-	RuntimeApi:
-		ConstructRuntimeApi<Block, FullClient<RuntimeApi, Executor>> + Send + Sync + 'static,
-	RuntimeApi::RuntimeApi:
+	agent: Option<std::net::SocketAddr>,
+) -> Result<(), Error> {
+	if let Some(agent) = agent {
+		let cfg = jaeger::JaegerConfig::builder()
+			.agent(agent)
+			.named(&config.network.node_name)
+			.build();
+
+		jaeger::Jaeger::new(cfg).launch(spawner)?;
+	}
+	Ok(())
+}
+
+#[cfg(feature = "full-node")]
+type FullSelectChain = relay_chain_selection::SelectRelayChain<FullBackend>;
+#[cfg(feature = "full-node")]
+type FullGrandpaBlockImport<RuntimeApi, ExecutorDispatch, ChainSelection = FullSelectChain> =
+grandpa::GrandpaBlockImport<
+	FullBackend,
+	Block,
+	FullClient<RuntimeApi, ExecutorDispatch>,
+	ChainSelection,
+>;
+
+#[cfg(feature = "full-node")]
+struct Basics<RuntimeApi, ExecutorDispatch>
+	where
+		RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, ExecutorDispatch>>
+		+ Send
+		+ Sync
+		+ 'static,
+		RuntimeApi::RuntimeApi:
 		RuntimeApiCollection<StateBackend = sc_client_api::StateBackendFor<FullBackend, Block>>,
-	Executor: NativeExecutionDispatch + 'static,
+		ExecutorDispatch: NativeExecutionDispatch + 'static,
+{
+	task_manager: TaskManager,
+	client: Arc<FullClient<RuntimeApi, ExecutorDispatch>>,
+	backend: Arc<FullBackend>,
+	keystore_container: KeystoreContainer,
+	telemetry: Option<Telemetry>,
+}
+
+#[cfg(feature = "full-node")]
+fn new_partial_basics<RuntimeApi, ExecutorDispatch>(
+	config: &mut Configuration,
+	jaeger_agent: Option<std::net::SocketAddr>,
+	telemetry_worker_handle: Option<TelemetryWorkerHandle>,
+) -> Result<Basics<RuntimeApi, ExecutorDispatch>, Error>
+	where
+		RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, ExecutorDispatch>>
+		+ Send
+		+ Sync
+		+ 'static,
+		RuntimeApi::RuntimeApi:
+		RuntimeApiCollection<StateBackend = sc_client_api::StateBackendFor<FullBackend, Block>>,
+		ExecutorDispatch: NativeExecutionDispatch + 'static,
 {
 	let telemetry = config
 		.telemetry_endpoints
 		.clone()
 		.filter(|x| !x.is_empty())
-		.map(|endpoints| -> Result<_, sc_telemetry::Error> {
-			let worker = TelemetryWorker::new(16)?;
-			let telemetry = worker.handle().new_telemetry(endpoints);
+		.map(move |endpoints| -> Result<_, telemetry::Error> {
+			let (worker, mut worker_handle) = if let Some(worker_handle) = telemetry_worker_handle {
+				(None, worker_handle)
+			} else {
+				let worker = TelemetryWorker::new(16)?;
+				let worker_handle = worker.handle();
+				(Some(worker), worker_handle)
+			};
+			let telemetry = worker_handle.new_telemetry(endpoints);
 			Ok((worker, telemetry))
 		})
 		.transpose()?;
 
+	let executor = NativeElseWasmExecutor::<ExecutorDispatch>::new(
+		config.wasm_method,
+		config.default_heap_pages,
+		config.max_runtime_instances,
+		config.runtime_cache_size,
+	);
+
 	let (client, backend, keystore_container, task_manager) =
-		sc_service::new_full_parts::<Block, RuntimeApi, Executor>(
+		service::new_full_parts::<Block, RuntimeApi, _>(
 			&config,
 			telemetry.as_ref().map(|(_, telemetry)| telemetry.handle()),
+			executor,
 		)?;
-
 	let client = Arc::new(client);
 
-	let telemetry_worker_handle = telemetry.as_ref().map(|(worker, _)| worker.handle());
-
 	let telemetry = telemetry.map(|(worker, telemetry)| {
-		task_manager.spawn_handle().spawn("telemetry", worker.run());
+		if let Some(worker) = worker {
+			task_manager.spawn_handle().spawn(
+				"telemetry",
+				Some("telemetry"),
+				Box::pin(worker.run()),
+			);
+		}
 		telemetry
 	});
 
-	let maybe_select_chain = if dev_service {
-		Some(sc_consensus::LongestChain::new(backend.clone()))
-	} else {
-		None
-	};
+	jaeger_launch_collector_with_agent(task_manager.spawn_handle(), &*config, jaeger_agent)?;
 
+	Ok(Basics { task_manager, client, backend, keystore_container, telemetry })
+}
+
+#[cfg(feature = "full-node")]
+fn new_partial<RuntimeApi, ExecutorDispatch, ChainSelection>(
+	config: &mut Configuration,
+	Basics { task_manager, backend, client, keystore_container, telemetry }: Basics<
+		RuntimeApi,
+		ExecutorDispatch,
+	>,
+	select_chain: ChainSelection,
+) -> Result<
+	service::PartialComponents<
+		FullClient<RuntimeApi, ExecutorDispatch>,
+		FullBackend,
+		ChainSelection,
+		sc_consensus::DefaultImportQueue<Block, FullClient<RuntimeApi, ExecutorDispatch>>,
+		sc_transaction_pool::FullPool<Block, FullClient<RuntimeApi, ExecutorDispatch>>,
+		(
+			impl service::RpcExtensionBuilder,
+			(
+				babe::BabeBlockImport<
+					Block,
+					FullClient<RuntimeApi, ExecutorDispatch>,
+					FullGrandpaBlockImport<RuntimeApi, ExecutorDispatch, ChainSelection>,
+				>,
+				grandpa::LinkHalf<Block, FullClient<RuntimeApi, ExecutorDispatch>, ChainSelection>,
+				babe::BabeLink<Block>,
+				(BeefySignedCommitmentSender<Block>, BeefyBestBlockSender<Block>),
+			),
+			grandpa::SharedVoterState,
+			sp_consensus_babe::SlotDuration,
+			Option<Telemetry>,
+		),
+	>,
+	Error,
+>
+	where
+		RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, ExecutorDispatch>>
+		+ Send
+		+ Sync
+		+ 'static,
+		RuntimeApi::RuntimeApi:
+		RuntimeApiCollection<StateBackend = sc_client_api::StateBackendFor<FullBackend, Block>>,
+		ExecutorDispatch: NativeExecutionDispatch + 'static,
+		ChainSelection: 'static + SelectChain<Block>,
+{
 	let transaction_pool = sc_transaction_pool::BasicPool::new_full(
 		config.transaction_pool.clone(),
 		config.role.is_authority().into(),
@@ -286,553 +424,922 @@ where
 		client.clone(),
 	);
 
-	let pending_transactions: PendingTransactions = Some(Arc::new(Mutex::new(HashMap::new())));
-
-	let filter_pool: Option<FilterPool> = Some(Arc::new(Mutex::new(BTreeMap::new())));
-
-	let frontier_backend = open_frontier_backend(config)?;
-
-	let frontier_block_import =
-		FrontierBlockImport::new(client.clone(), client.clone(), frontier_backend.clone());
-
-	// Depending whether we are
-	let import_queue = if dev_service {
-		// There is a bug in this import queue where it doesn't properly check inherents:
-		// https://github.com/paritytech/substrate/issues/8164
-		sc_consensus_manual_seal::import_queue(
-			Box::new(frontier_block_import.clone()),
-			&task_manager.spawn_essential_handle(),
-			config.prometheus_registry(),
-		)
+	let grandpa_hard_forks = if config.chain_spec.is_kusama() {
+		grandpa_support::kusama_hard_forks()
 	} else {
-		nimbus_consensus::import_queue(
-			client.clone(),
-			frontier_block_import.clone(),
-			move |_, _| async move {
-				let time = sp_timestamp::InherentDataProvider::from_system_time();
-
-				Ok((time,))
-			},
-			&task_manager.spawn_essential_handle(),
-			config.prometheus_registry(),
-		)?
+		Vec::new()
 	};
 
-	Ok(PartialComponents {
-		backend,
+	let (grandpa_block_import, grandpa_link) = grandpa::block_import_with_authority_set_hard_forks(
+		client.clone(),
+		&(client.clone() as Arc<_>),
+		select_chain.clone(),
+		grandpa_hard_forks,
+		telemetry.as_ref().map(|x| x.handle()),
+	)?;
+
+	let justification_import = grandpa_block_import.clone();
+
+	let babe_config = babe::Config::get(&*client)?;
+	let (block_import, babe_link) =
+		babe::block_import(babe_config.clone(), grandpa_block_import, client.clone())?;
+
+	let slot_duration = babe_link.config().slot_duration();
+	let import_queue = babe::import_queue(
+		babe_link.clone(),
+		block_import.clone(),
+		Some(Box::new(justification_import)),
+		client.clone(),
+		select_chain.clone(),
+		move |_, ()| async move {
+			let timestamp = sp_timestamp::InherentDataProvider::from_system_time();
+
+			let slot =
+				sp_consensus_babe::inherents::InherentDataProvider::from_timestamp_and_slot_duration(
+					*timestamp,
+					slot_duration,
+				);
+
+			Ok((timestamp, slot))
+		},
+		&task_manager.spawn_essential_handle(),
+		config.prometheus_registry(),
+		consensus_common::CanAuthorWithNativeVersion::new(client.executor().clone()),
+		telemetry.as_ref().map(|x| x.handle()),
+	)?;
+
+	let (beefy_commitment_link, beefy_commitment_stream) =
+		beefy_gadget::notification::BeefySignedCommitmentStream::<Block>::channel();
+	let (beefy_best_block_link, beefy_best_block_stream) =
+		beefy_gadget::notification::BeefyBestBlockStream::<Block>::channel();
+	let beefy_links = (beefy_commitment_link, beefy_best_block_link);
+
+	let justification_stream = grandpa_link.justification_stream();
+	let shared_authority_set = grandpa_link.shared_authority_set().clone();
+	let shared_voter_state = grandpa::SharedVoterState::empty();
+	let finality_proof_provider = GrandpaFinalityProofProvider::new_for_service(
+		backend.clone(),
+		Some(shared_authority_set.clone()),
+	);
+
+	let shared_epoch_changes = babe_link.epoch_changes().clone();
+	let slot_duration = babe_config.slot_duration();
+
+	let import_setup = (block_import, grandpa_link, babe_link, beefy_links);
+	let rpc_setup = shared_voter_state.clone();
+
+	let rpc_extensions_builder = {
+		let client = client.clone();
+		let keystore = keystore_container.sync_keystore();
+		let transaction_pool = transaction_pool.clone();
+		let select_chain = select_chain.clone();
+		let chain_spec = config.chain_spec.cloned_box();
+		let backend = backend.clone();
+
+		move |deny_unsafe,
+			  subscription_executor: moonrabbit_rpc::SubscriptionTaskExecutor|
+			  -> Result<moonrabbit_rpc::RpcExtension, service::Error> {
+			let deps = moonrabbit_rpc::FullDeps {
+				client: client.clone(),
+				pool: transaction_pool.clone(),
+				select_chain: select_chain.clone(),
+				chain_spec: chain_spec.cloned_box(),
+				deny_unsafe,
+				babe: moonrabbit_rpc::BabeDeps {
+					babe_config: babe_config.clone(),
+					shared_epoch_changes: shared_epoch_changes.clone(),
+					keystore: keystore.clone(),
+				},
+				grandpa: moonrabbit_rpc::GrandpaDeps {
+					shared_voter_state: shared_voter_state.clone(),
+					shared_authority_set: shared_authority_set.clone(),
+					justification_stream: justification_stream.clone(),
+					subscription_executor: subscription_executor.clone(),
+					finality_provider: finality_proof_provider.clone(),
+				},
+				beefy: moonrabbit_rpc::BeefyDeps {
+					beefy_commitment_stream: beefy_commitment_stream.clone(),
+					beefy_best_block_stream: beefy_best_block_stream.clone(),
+					subscription_executor,
+				},
+			};
+
+			moonrabbit_rpc::create_full(deps, backend.clone()).map_err(Into::into)
+		}
+	};
+
+	Ok(service::PartialComponents {
 		client,
-		import_queue,
-		keystore_container,
+		backend,
 		task_manager,
+		keystore_container,
+		select_chain,
+		import_queue,
 		transaction_pool,
-		select_chain: maybe_select_chain,
-		other: (
-			frontier_block_import,
-			pending_transactions,
-			filter_pool,
-			telemetry,
-			telemetry_worker_handle,
-			frontier_backend,
-		),
+		other: (rpc_extensions_builder, import_setup, rpc_setup, slot_duration, telemetry),
 	})
 }
 
-/// `fp_rpc::ConvertTransaction` is implemented for an arbitrary struct that lives in each runtime.
-/// It receives a ethereum::Transaction and returns a pallet-ethereum transact Call wrapped in an
-/// UncheckedExtrinsic.
-///
-/// Although the implementation should be the same in each runtime, this might change at some point.
-/// `TransactionConverters` is just a `fp_rpc::ConvertTransaction` implementor that proxies calls to
-/// each runtime implementation.
-pub enum TransactionConverters {
-	 mrevm( mrevm_runtime::TransactionConverter),
-	Moonbase(moonbase_runtime::TransactionConverter),
-	mrevm(mrevm_runtime::TransactionConverter),
+#[cfg(feature = "full-node")]
+pub struct NewFull<C> {
+	pub task_manager: TaskManager,
+	pub client: C,
+	pub overseer_handle: Option<Handle>,
+	pub network: Arc<sc_network::NetworkService<Block, <Block as BlockT>::Hash>>,
+	pub rpc_handlers: RpcHandlers,
+	pub backend: Arc<FullBackend>,
 }
 
-impl fp_rpc::ConvertTransaction< mrevm_core_primitives::UncheckedExtrinsic>
-	for TransactionConverters
-{
-	fn convert_transaction(
-		&self,
-		transaction: ethereum_primitives::Transaction,
-	) ->  mrevm_core_primitives::UncheckedExtrinsic {
-		match &self {
-			Self:: mrevm(inner) => inner.convert_transaction(transaction),
-			Self::mrevm(inner) => inner.convert_transaction(transaction),
-			Self::Moonbase(inner) => inner.convert_transaction(transaction),
+#[cfg(feature = "full-node")]
+impl<C> NewFull<C> {
+	/// Convert the client type using the given `func`.
+	pub fn with_client<NC>(self, func: impl FnOnce(C) -> NC) -> NewFull<NC> {
+		NewFull {
+			client: func(self.client),
+			task_manager: self.task_manager,
+			overseer_handle: self.overseer_handle,
+			network: self.network,
+			rpc_handlers: self.rpc_handlers,
+			backend: self.backend,
 		}
 	}
 }
 
-/// Start a node with the given jurisdiction `Configuration` and relay chain `Configuration`.
-///
-/// This is the actual implementation that is abstract over the executor and the runtime api.
-#[sc_tracing::logging::prefix_logs_with("🌗")]
-async fn start_node_impl<RuntimeApi, Executor>(
-	jurisdiction_config: Configuration,
-	moonrabbit_config: Configuration,
-	id: moonrabbit_primitives::v0::Id,
-	rpc_config: RpcConfig,
-) -> sc_service::error::Result<(TaskManager, Arc<TFullClient<Block, RuntimeApi, Executor>>)>
-where
-	RuntimeApi:
-		ConstructRuntimeApi<Block, FullClient<RuntimeApi, Executor>> + Send + Sync + 'static,
-	RuntimeApi::RuntimeApi:
-		RuntimeApiCollection<StateBackend = sc_client_api::StateBackendFor<FullBackend, Block>>,
-	Executor: NativeExecutionDispatch + 'static,
-{
-	if matches!(jurisdiction_config.role, Role::Light) {
-		return Err("Light client not supported!".into());
+/// Is this node a collator?
+#[cfg(feature = "full-node")]
+#[derive(Clone)]
+pub enum IsCollator {
+	/// This node is a collator.
+	Yes(CollatorPair),
+	/// This node is not a collator.
+	No,
+}
+
+#[cfg(feature = "full-node")]
+impl std::fmt::Debug for IsCollator {
+	fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+		use sp_core::Pair;
+		match self {
+			IsCollator::Yes(pair) => write!(fmt, "Yes({})", pair.public()),
+			IsCollator::No => write!(fmt, "No"),
+		}
 	}
+}
 
-	let jurisdiction_config = prepare_node_config(jurisdiction_config);
+#[cfg(feature = "full-node")]
+impl IsCollator {
+	/// Is this a collator?
+	fn is_collator(&self) -> bool {
+		matches!(self, Self::Yes(_))
+	}
+}
 
-	let params = new_partial(&jurisdiction_config, false)?;
-	let (
-		block_import,
-		pending_transactions,
-		filter_pool,
-		mut telemetry,
-		telemetry_worker_handle,
-		frontier_backend,
-	) = params.other;
+/// Returns the active leaves the overseer should start with.
+#[cfg(feature = "full-node")]
+async fn active_leaves<RuntimeApi, ExecutorDispatch>(
+	select_chain: &impl SelectChain<Block>,
+	client: &FullClient<RuntimeApi, ExecutorDispatch>,
+) -> Result<Vec<BlockInfo>, Error>
+	where
+		RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, ExecutorDispatch>>
+		+ Send
+		+ Sync
+		+ 'static,
+		RuntimeApi::RuntimeApi:
+		RuntimeApiCollection<StateBackend = sc_client_api::StateBackendFor<FullBackend, Block>>,
+		ExecutorDispatch: NativeExecutionDispatch + 'static,
+{
+	let best_block = select_chain.best_chain().await?;
 
-	let relay_chain_full_node =
-		cumulus_client_service::build_moonrabbit_full_node(moonrabbit_config, telemetry_worker_handle)
-			.map_err(|e| match e {
-				moonrabbit_service::Error::Sub(x) => x,
-				s => format!("{}", s).into(),
-			})?;
+	let mut leaves = select_chain
+		.leaves()
+		.await
+		.unwrap_or_default()
+		.into_iter()
+		.filter_map(|hash| {
+			let number = HeaderBackend::number(client, hash).ok()??;
 
-	let client = params.client.clone();
-	let backend = params.backend.clone();
-	let block_announce_validator = build_block_announce_validator(
-		relay_chain_full_node.client.clone(),
-		id,
-		Box::new(relay_chain_full_node.network.clone()),
-		relay_chain_full_node.backend.clone(),
-	);
-
-	let collator = jurisdiction_config.role.is_authority();
-	let prometheus_registry = jurisdiction_config.prometheus_registry().cloned();
-	let transaction_pool = params.transaction_pool.clone();
-	let mut task_manager = params.task_manager;
-	let import_queue = cumulus_client_service::SharedImportQueue::new(params.import_queue);
-	let (network, system_rpc_tx, start_network) =
-		sc_service::build_network(sc_service::BuildNetworkParams {
-			config: &jurisdiction_config,
-			client: client.clone(),
-			transaction_pool: transaction_pool.clone(),
-			spawn_handle: task_manager.spawn_handle(),
-			import_queue: import_queue.clone(),
-			on_demand: None,
-			block_announce_validator_builder: Some(Box::new(|_| block_announce_validator)),
-		})?;
-
-	let subscription_task_executor =
-		sc_rpc::SubscriptionTaskExecutor::new(task_manager.spawn_handle());
-
-	let spawned_requesters = rpc::spawn_tasks(
-		&rpc_config,
-		rpc::SpawnTasksParams {
-			task_manager: &task_manager,
-			client: client.clone(),
-			substrate_backend: backend.clone(),
-			frontier_backend: frontier_backend.clone(),
-			pending_transactions: pending_transactions.clone(),
-			filter_pool: filter_pool.clone(),
-		},
-	);
-
-	let rpc_extensions_builder = {
-		let client = client.clone();
-		let pool = transaction_pool.clone();
-		let network = network.clone();
-		let pending = pending_transactions.clone();
-		let filter_pool = filter_pool.clone();
-		let frontier_backend = frontier_backend.clone();
-		let backend = backend.clone();
-		let ethapi_cmd = rpc_config.ethapi.clone();
-		let max_past_logs = rpc_config.max_past_logs;
-
-		let is_ mrevm = jurisdiction_config.chain_spec.is_ mrevm();
-		let is_mrevm = jurisdiction_config.chain_spec.is_mrevm();
-
-		Box::new(move |deny_unsafe, _| {
-			let transaction_converter: TransactionConverters = if is_ mrevm {
-				TransactionConverters:: mrevm( mrevm_runtime::TransactionConverter)
-			} else if is_mrevm {
-				TransactionConverters::mrevm(mrevm_runtime::TransactionConverter)
-			} else {
-				TransactionConverters::Moonbase(moonbase_runtime::TransactionConverter)
+			// Only consider leaves that are in maximum an uncle of the best block.
+			if number < best_block.number().saturating_sub(1) {
+				return None
+			} else if hash == best_block.hash() {
+				return None
 			};
 
-			let deps = rpc::FullDeps {
-				client: client.clone(),
-				pool: pool.clone(),
-				graph: pool.pool().clone(),
-				deny_unsafe,
-				is_authority: collator,
-				network: network.clone(),
-				pending_transactions: pending.clone(),
-				filter_pool: filter_pool.clone(),
-				ethapi_cmd: ethapi_cmd.clone(),
-				command_sink: None,
-				frontier_backend: frontier_backend.clone(),
-				backend: backend.clone(),
-				debug_requester: spawned_requesters.debug.clone(),
-				trace_filter_requester: spawned_requesters.trace.clone(),
-				trace_filter_max_count: rpc_config.ethapi_trace_max_count,
-				max_past_logs,
-				transaction_converter,
-			};
+			let parent_hash = client.header(&BlockId::Hash(hash)).ok()??.parent_hash;
 
-			rpc::create_full(deps, subscription_task_executor.clone())
+			Some(BlockInfo { hash, parent_hash, number })
 		})
-	};
+		.collect::<Vec<_>>();
 
-	sc_service::spawn_tasks(sc_service::SpawnTasksParams {
-		on_demand: None,
-		remote_blockchain: None,
-		rpc_extensions_builder,
-		client: client.clone(),
-		transaction_pool: transaction_pool.clone(),
-		task_manager: &mut task_manager,
-		config: jurisdiction_config,
-		keystore: params.keystore_container.sync_keystore(),
-		backend: backend.clone(),
-		network: network.clone(),
-		system_rpc_tx,
-		telemetry: telemetry.as_mut(),
-	})?;
+	// Sort by block number and get the maximum number of leaves
+	leaves.sort_by_key(|b| b.number);
 
-	let announce_block = {
-		let network = network.clone();
-		Arc::new(move |hash, data| network.announce_block(hash, data))
-	};
+	leaves.push(BlockInfo {
+		hash: best_block.hash(),
+		parent_hash: *best_block.parent_hash(),
+		number: *best_block.number(),
+	});
 
-	if collator {
-		let proposer_factory = sc_basic_authorship::ProposerFactory::with_proof_recording(
-			task_manager.spawn_handle(),
-			client.clone(),
-			transaction_pool,
-			prometheus_registry.as_ref(),
-			telemetry.as_ref().map(|t| t.handle()),
-		);
-
-		let relay_chain_backend = relay_chain_full_node.backend.clone();
-		let relay_chain_client = relay_chain_full_node.client.clone();
-
-		let jurisdiction_consensus = build_nimbus_consensus(BuildNimbusConsensusParams {
-			para_id: id,
-			proposer_factory,
-			block_import,
-			relay_chain_client: relay_chain_full_node.client.clone(),
-			relay_chain_backend: relay_chain_full_node.backend.clone(),
-			jurisdiction_client: client.clone(),
-			keystore: params.keystore_container.sync_keystore(),
-			create_inherent_data_providers: move |_, (relay_parent, validation_data, author_id)| {
-				let jurisdiction_inherent =
-							cumulus_primitives_jurisdiction_inherent::JurisdictionInherentData::
-							create_at_with_client(
-								relay_parent,
-								&relay_chain_client,
-								&*relay_chain_backend,
-								&validation_data,
-								id,
-							);
-				async move {
-					let time = sp_timestamp::InherentDataProvider::from_system_time();
-
-					let jurisdiction_inherent = jurisdiction_inherent.ok_or_else(|| {
-						Box::<dyn std::error::Error + Send + Sync>::from(
-							"Failed to create jurisdiction inherent",
-						)
-					})?;
-
-					let author = nimbus_primitives::InherentDataProvider::<NimbusId>(author_id);
-
-					Ok((time, jurisdiction_inherent, author))
-				}
-			},
-		});
-
-		let spawner = task_manager.spawn_handle();
-
-		let params = StartCollatorParams {
-			para_id: id,
-			block_status: client.clone(),
-			announce_block,
-			client: client.clone(),
-			task_manager: &mut task_manager,
-			spawner,
-			relay_chain_full_node,
-			jurisdiction_consensus,
-			import_queue,
-		};
-
-		start_collator(params).await?;
-	} else {
-		let params = StartFullNodeParams {
-			client: client.clone(),
-			announce_block,
-			task_manager: &mut task_manager,
-			para_id: id,
-			relay_chain_full_node,
-		};
-
-		start_full_node(params)?;
-	}
-
-	start_network.start_network();
-
-	Ok((task_manager, client))
+	Ok(leaves.into_iter().rev().take(MAX_ACTIVE_LEAVES).collect())
 }
 
-/// Start a normal jurisdiction node.
-pub async fn start_node<RuntimeApi, Executor>(
-	jurisdiction_config: Configuration,
-	moonrabbit_config: Configuration,
-	id: moonrabbit_primitives::v0::Id,
-	rpc_config: RpcConfig,
-) -> sc_service::error::Result<(TaskManager, Arc<TFullClient<Block, RuntimeApi, Executor>>)>
-where
-	RuntimeApi:
-		ConstructRuntimeApi<Block, FullClient<RuntimeApi, Executor>> + Send + Sync + 'static,
-	RuntimeApi::RuntimeApi:
+/// Create a new full node of arbitrary runtime and executor.
+///
+/// This is an advanced feature and not recommended for general use. Generally, `build_full` is
+/// a better choice.
+///
+/// `overseer_enable_anyways` always enables the overseer, based on the provided `OverseerGenerator`,
+/// regardless of the role the node has. The relay chain selection (longest or disputes-aware) is
+/// still determined based on the role of the node. Likewise for authority discovery.
+#[cfg(feature = "full-node")]
+pub fn new_full<RuntimeApi, ExecutorDispatch, OverseerGenerator>(
+	mut config: Configuration,
+	is_collator: IsCollator,
+	grandpa_pause: Option<(u32, u32)>,
+	enable_beefy: bool,
+	jaeger_agent: Option<std::net::SocketAddr>,
+	telemetry_worker_handle: Option<TelemetryWorkerHandle>,
+	program_path: Option<std::path::PathBuf>,
+	overseer_enable_anyways: bool,
+	overseer_gen: OverseerGenerator,
+) -> Result<NewFull<Arc<FullClient<RuntimeApi, ExecutorDispatch>>>, Error>
+	where
+		RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, ExecutorDispatch>>
+		+ Send
+		+ Sync
+		+ 'static,
+		RuntimeApi::RuntimeApi:
 		RuntimeApiCollection<StateBackend = sc_client_api::StateBackendFor<FullBackend, Block>>,
-	Executor: NativeExecutionDispatch + 'static,
+		ExecutorDispatch: NativeExecutionDispatch + 'static,
+		OverseerGenerator: OverseerGen,
 {
-	start_node_impl(jurisdiction_config, moonrabbit_config, id, rpc_config).await
-}
+	use moonrabbit_node_network_protocol::request_response::IncomingRequest;
 
-/// Builds a new development service. This service uses manual seal, and mocks
-/// the jurisdiction inherent.
-pub fn new_dev(
-	config: Configuration,
-	_author_id: Option<nimbus_primitives::NimbusId>,
-	sealing: cli_opt::Sealing,
-	rpc_config: RpcConfig,
-) -> Result<TaskManager, ServiceError> {
-	use async_io::Timer;
-	use futures::Stream;
-	use sc_consensus_manual_seal::{run_manual_seal, EngineCommand, ManualSealParams};
-	use sp_core::H256;
+	let role = config.role.clone();
+	let force_authoring = config.force_authoring;
+	let backoff_authoring_blocks = {
+		let mut backoff = sc_consensus_slots::BackoffAuthoringOnFinalizedHeadLagging::default();
 
-	let sc_service::PartialComponents {
+		if config.chain_spec.is_rococo() ||
+			config.chain_spec.is_wococo() ||
+			config.chain_spec.is_versi()
+		{
+			// it's a testnet that's in flux, finality has stalled sometimes due
+			// to operational issues and it's annoying to slow down block
+			// production to 1 block per hour.
+			backoff.max_interval = 10;
+		}
+
+		Some(backoff)
+	};
+
+	let disable_grandpa = config.disable_grandpa;
+	let name = config.network.node_name.clone();
+
+	let basics = new_partial_basics::<RuntimeApi, ExecutorDispatch>(
+		&mut config,
+		jaeger_agent,
+		telemetry_worker_handle,
+	)?;
+
+	let prometheus_registry = config.prometheus_registry().cloned();
+
+	let overseer_connector = OverseerConnector::default();
+	let overseer_handle = Handle::new(overseer_connector.handle());
+
+	let chain_spec = config.chain_spec.cloned_box();
+
+	let local_keystore = basics.keystore_container.local_keystore();
+	let auth_or_collator = role.is_authority() || is_collator.is_collator();
+	let requires_overseer_for_chain_sel = local_keystore.is_some() && auth_or_collator;
+
+	let pvf_checker_enabled = !is_collator.is_collator() && chain_spec.is_versi();
+
+	let select_chain = if requires_overseer_for_chain_sel {
+		let metrics =
+			moonrabbit_node_subsystem_util::metrics::Metrics::register(prometheus_registry.as_ref())?;
+
+		SelectRelayChain::new_with_overseer(
+			basics.backend.clone(),
+			overseer_handle.clone(),
+			metrics,
+		)
+	} else {
+		SelectRelayChain::new_longest_chain(basics.backend.clone())
+	};
+
+	let service::PartialComponents::<_, _, SelectRelayChain<_>, _, _, _> {
 		client,
 		backend,
 		mut task_manager,
-		import_queue,
 		keystore_container,
-		select_chain: maybe_select_chain,
+		select_chain,
+		import_queue,
 		transaction_pool,
-		other:
-			(
-				block_import,
-				pending_transactions,
-				filter_pool,
-				telemetry,
-				_telemetry_worker_handle,
-				frontier_backend,
-			),
-	} = new_partial::<moonbase_runtime::RuntimeApi, MoonbaseExecutor>(&config, true)?;
+		other: (rpc_extensions_builder, import_setup, rpc_setup, slot_duration, mut telemetry),
+	} = new_partial::<RuntimeApi, ExecutorDispatch, SelectRelayChain<_>>(
+		&mut config,
+		basics,
+		select_chain,
+	)?;
+
+	let shared_voter_state = rpc_setup;
+	let auth_disc_publish_non_global_ips = config.network.allow_non_globals_in_dht;
+
+	// Note: GrandPa is pushed before the moonrabbit-specific protocols. This doesn't change
+	// anything in terms of behaviour, but makes the logs more consistent with the other
+	// Substrate nodes.
+	let grandpa_protocol_name = grandpa::protocol_standard_name(
+		&client.block_hash(0).ok().flatten().expect("Genesis block exists; qed"),
+		&config.chain_spec,
+	);
+	config
+		.network
+		.extra_sets
+		.push(grandpa::grandpa_peers_set_config(grandpa_protocol_name.clone()));
+
+	let beefy_protocol_name = beefy_gadget::protocol_standard_name(
+		&client.block_hash(0).ok().flatten().expect("Genesis block exists; qed"),
+		&config.chain_spec,
+	);
+	if chain_spec.is_rococo() || chain_spec.is_wococo() || chain_spec.is_versi() {
+		config
+			.network
+			.extra_sets
+			.push(beefy_gadget::beefy_peers_set_config(beefy_protocol_name.clone()));
+	}
+
+	{
+		use moonrabbit_network_bridge::{peer_sets_info, IsAuthority};
+		let is_authority = if role.is_authority() { IsAuthority::Yes } else { IsAuthority::No };
+		config.network.extra_sets.extend(peer_sets_info(is_authority));
+	}
+
+	let (pov_req_receiver, cfg) = IncomingRequest::get_config_receiver();
+	config.network.request_response_protocols.push(cfg);
+	let (chunk_req_receiver, cfg) = IncomingRequest::get_config_receiver();
+	config.network.request_response_protocols.push(cfg);
+	let (collation_req_receiver, cfg) = IncomingRequest::get_config_receiver();
+	config.network.request_response_protocols.push(cfg);
+	let (available_data_req_receiver, cfg) = IncomingRequest::get_config_receiver();
+	config.network.request_response_protocols.push(cfg);
+	let (statement_req_receiver, cfg) = IncomingRequest::get_config_receiver();
+	config.network.request_response_protocols.push(cfg);
+	let (dispute_req_receiver, cfg) = IncomingRequest::get_config_receiver();
+	config.network.request_response_protocols.push(cfg);
+
+	let grandpa_hard_forks = if config.chain_spec.is_kusama() {
+		grandpa_support::kusama_hard_forks()
+	} else {
+		Vec::new()
+	};
+
+	let warp_sync = Arc::new(grandpa::warp_proof::NetworkProvider::new(
+		backend.clone(),
+		import_setup.1.shared_authority_set().clone(),
+		grandpa_hard_forks,
+	));
 
 	let (network, system_rpc_tx, network_starter) =
-		sc_service::build_network(sc_service::BuildNetworkParams {
+		service::build_network(service::BuildNetworkParams {
 			config: &config,
 			client: client.clone(),
 			transaction_pool: transaction_pool.clone(),
 			spawn_handle: task_manager.spawn_handle(),
 			import_queue,
-			on_demand: None,
 			block_announce_validator_builder: None,
+			warp_sync: Some(warp_sync),
 		})?;
 
 	if config.offchain_worker.enabled {
-		sc_service::build_offchain_workers(
-			&config,
-			task_manager.spawn_handle(),
+		let offchain_workers = Arc::new(sc_offchain::OffchainWorkers::new_with_options(
 			client.clone(),
-			network.clone(),
+			sc_offchain::OffchainWorkerOptions { enable_http_requests: false },
+		));
+
+		// Start the offchain workers to have
+		task_manager.spawn_handle().spawn(
+			"offchain-notifications",
+			None,
+			sc_offchain::notification_future(
+				config.role.is_authority(),
+				client.clone(),
+				offchain_workers,
+				task_manager.spawn_handle().clone(),
+				network.clone(),
+			),
 		);
 	}
 
-	let prometheus_registry = config.prometheus_registry().cloned();
-	let subscription_task_executor =
-		sc_rpc::SubscriptionTaskExecutor::new(task_manager.spawn_handle());
-	let mut command_sink = None;
-	let collator = config.role.is_authority();
+	let parachains_db = match &config.database {
+		DatabaseSource::RocksDb { path, .. } => crate::parachains_db::open_creating_rocksdb(
+			path.clone(),
+			crate::parachains_db::CacheSizes::default(),
+		)?,
+		DatabaseSource::ParityDb { path, .. } => crate::parachains_db::open_creating_paritydb(
+			path.parent().ok_or(Error::DatabasePathRequired)?.into(),
+			crate::parachains_db::CacheSizes::default(),
+		)?,
+		DatabaseSource::Auto { paritydb_path, rocksdb_path, .. } =>
+			if paritydb_path.is_dir() && paritydb_path.exists() {
+				crate::parachains_db::open_creating_paritydb(
+					paritydb_path.parent().ok_or(Error::DatabasePathRequired)?.into(),
+					crate::parachains_db::CacheSizes::default(),
+				)?
+			} else {
+				crate::parachains_db::open_creating_rocksdb(
+					rocksdb_path.clone(),
+					crate::parachains_db::CacheSizes::default(),
+				)?
+			},
+		DatabaseSource::Custom { .. } => {
+			unimplemented!("No moonrabbit subsystem db for custom source.");
+		},
+	};
 
-	if collator {
-		//TODO For now, all dev service nodes use Alith's nimbus id in their author inherent.
-		// This could and perhaps should be made more flexible. Here are some options:
-		// 1. a dedicated `--dev-author-id` flag that only works with the dev service
-		// 2. restore the old --author-id` and also allow it to force a secific key
-		//    in the jurisdiction context
-		// 3. check the keystore like we do in nimbus. Actually, maybe the keystore-checking could
-		//    be exported as a helper function from nimbus.
-		let author_id = chain_spec::get_from_seed::<NimbusId>("Alice");
+	let availability_config = AvailabilityConfig {
+		col_data: crate::parachains_db::REAL_COLUMNS.col_availability_data,
+		col_meta: crate::parachains_db::REAL_COLUMNS.col_availability_meta,
+	};
 
-		let env = sc_basic_authorship::ProposerFactory::new(
+	let approval_voting_config = ApprovalVotingConfig {
+		col_data: crate::parachains_db::REAL_COLUMNS.col_approval_data,
+		slot_duration_millis: slot_duration.as_millis() as u64,
+	};
+
+	let candidate_validation_config = CandidateValidationConfig {
+		artifacts_cache_path: config
+			.database
+			.path()
+			.ok_or(Error::DatabasePathRequired)?
+			.join("pvf-artifacts"),
+		program_path: match program_path {
+			None => std::env::current_exe()?,
+			Some(p) => p,
+		},
+	};
+
+	let chain_selection_config = ChainSelectionConfig {
+		col_data: crate::parachains_db::REAL_COLUMNS.col_chain_selection_data,
+		stagnant_check_interval: chain_selection_subsystem::StagnantCheckInterval::never(),
+	};
+
+	let dispute_coordinator_config = DisputeCoordinatorConfig {
+		col_data: crate::parachains_db::REAL_COLUMNS.col_dispute_coordinator_data,
+	};
+
+	let rpc_handlers = service::spawn_tasks(service::SpawnTasksParams {
+		config,
+		backend: backend.clone(),
+		client: client.clone(),
+		keystore: keystore_container.sync_keystore(),
+		network: network.clone(),
+		rpc_extensions_builder: Box::new(rpc_extensions_builder),
+		transaction_pool: transaction_pool.clone(),
+		task_manager: &mut task_manager,
+		system_rpc_tx,
+		telemetry: telemetry.as_mut(),
+	})?;
+
+	let (block_import, link_half, babe_link, beefy_links) = import_setup;
+
+	let overseer_client = client.clone();
+	let spawner = task_manager.spawn_handle();
+	// Cannot use the `RelayChainSelection`, since that'd require a setup _and running_ overseer
+	// which we are about to setup.
+	let active_leaves =
+		futures::executor::block_on(active_leaves(select_chain.as_longest_chain(), &*client))?;
+
+	let authority_discovery_service = if auth_or_collator || overseer_enable_anyways {
+		use futures::StreamExt;
+		use sc_network::Event;
+
+		let authority_discovery_role = if role.is_authority() {
+			sc_authority_discovery::Role::PublishAndDiscover(keystore_container.keystore())
+		} else {
+			// don't publish our addresses when we're not an authority (collator, cumulus, ..)
+			sc_authority_discovery::Role::Discover
+		};
+		let dht_event_stream =
+			network.event_stream("authority-discovery").filter_map(|e| async move {
+				match e {
+					Event::Dht(e) => Some(e),
+					_ => None,
+				}
+			});
+		let (worker, service) = sc_authority_discovery::new_worker_and_service_with_config(
+			sc_authority_discovery::WorkerConfig {
+				publish_non_global_ips: auth_disc_publish_non_global_ips,
+				..Default::default()
+			},
+			client.clone(),
+			network.clone(),
+			Box::pin(dht_event_stream),
+			authority_discovery_role,
+			prometheus_registry.clone(),
+		);
+
+		task_manager.spawn_handle().spawn(
+			"authority-discovery-worker",
+			Some("authority-discovery"),
+			Box::pin(worker.run()),
+		);
+		Some(service)
+	} else {
+		None
+	};
+
+	if local_keystore.is_none() {
+		gum::info!("Cannot run as validator without local keystore.");
+	}
+
+	let maybe_params =
+		local_keystore.and_then(move |k| authority_discovery_service.map(|a| (a, k)));
+
+	let overseer_handle = if let Some((authority_discovery_service, keystore)) = maybe_params {
+		let (overseer, overseer_handle) = overseer_gen
+			.generate::<service::SpawnTaskHandle, FullClient<RuntimeApi, ExecutorDispatch>>(
+				overseer_connector,
+				OverseerGenArgs {
+					leaves: active_leaves,
+					keystore,
+					runtime_client: overseer_client.clone(),
+					parachains_db,
+					network_service: network.clone(),
+					authority_discovery_service,
+					pov_req_receiver,
+					chunk_req_receiver,
+					collation_req_receiver,
+					available_data_req_receiver,
+					statement_req_receiver,
+					dispute_req_receiver,
+					registry: prometheus_registry.as_ref(),
+					spawner,
+					is_collator,
+					approval_voting_config,
+					availability_config,
+					candidate_validation_config,
+					chain_selection_config,
+					dispute_coordinator_config,
+					pvf_checker_enabled,
+				},
+			)
+			.map_err(|e| {
+				gum::error!("Failed to init overseer: {}", e);
+				e
+			})?;
+		let handle = Handle::new(overseer_handle.clone());
+
+		{
+			let handle = handle.clone();
+			task_manager.spawn_essential_handle().spawn_blocking(
+				"overseer",
+				None,
+				Box::pin(async move {
+					use futures::{pin_mut, select, FutureExt};
+
+					let forward = moonrabbit_overseer::forward_events(overseer_client, handle);
+
+					let forward = forward.fuse();
+					let overseer_fut = overseer.run().fuse();
+
+					pin_mut!(overseer_fut);
+					pin_mut!(forward);
+
+					select! {
+						_ = forward => (),
+						_ = overseer_fut => (),
+						complete => (),
+					}
+				}),
+			);
+		}
+		Some(handle)
+	} else {
+		assert!(
+			!requires_overseer_for_chain_sel,
+			"Precondition congruence (false) is guaranteed by manual checking. qed"
+		);
+		None
+	};
+
+	if role.is_authority() {
+		let can_author_with =
+			consensus_common::CanAuthorWithNativeVersion::new(client.executor().clone());
+
+		let proposer = sc_basic_authorship::ProposerFactory::new(
 			task_manager.spawn_handle(),
 			client.clone(),
-			transaction_pool.clone(),
+			transaction_pool,
 			prometheus_registry.as_ref(),
 			telemetry.as_ref().map(|x| x.handle()),
 		);
 
-		let commands_stream: Box<dyn Stream<Item = EngineCommand<H256>> + Send + Sync + Unpin> =
-			match sealing {
-				cli_opt::Sealing::Instant => {
-					Box::new(
-						// This bit cribbed from the implementation of instant seal.
-						transaction_pool
-							.pool()
-							.validated_pool()
-							.import_notification_stream()
-							.map(|_| EngineCommand::SealNewBlock {
-								create_empty: false,
-								finalize: false,
-								parent_hash: None,
-								sender: None,
-							}),
-					)
-				}
-				cli_opt::Sealing::Manual => {
-					let (sink, stream) = futures::channel::mpsc::channel(1000);
-					// Keep a reference to the other end of the channel. It goes to the RPC.
-					command_sink = Some(sink);
-					Box::new(stream)
-				}
-				cli_opt::Sealing::Interval(millis) => Box::new(StreamExt::map(
-					Timer::interval(Duration::from_millis(millis)),
-					|_| EngineCommand::SealNewBlock {
-						create_empty: true,
-						finalize: false,
-						parent_hash: None,
-						sender: None,
-					},
-				)),
-			};
+		let client_clone = client.clone();
+		let overseer_handle =
+			overseer_handle.as_ref().ok_or(Error::AuthoritiesRequireRealOverseer)?.clone();
+		let slot_duration = babe_link.config().slot_duration();
+		let babe_config = babe::BabeParams {
+			keystore: keystore_container.sync_keystore(),
+			client: client.clone(),
+			select_chain,
+			block_import,
+			env: proposer,
+			sync_oracle: network.clone(),
+			justification_sync_link: network.clone(),
+			create_inherent_data_providers: move |parent, ()| {
+				let client_clone = client_clone.clone();
+				let overseer_handle = overseer_handle.clone();
 
-		let select_chain = maybe_select_chain.expect(
-			"`new_partial` builds a `LongestChainRule` when building dev service.\
-				We specified the dev service when calling `new_partial`.\
-				Therefore, a `LongestChainRule` is present. qed.",
-		);
+				async move {
+					let parachain = moonrabbit_node_core_parachains_inherent::ParachainsInherentDataProvider::create(
+						&*client_clone,
+						overseer_handle,
+						parent,
+					).await.map_err(|e| Box::new(e))?;
 
-		let client_set_aside_for_cidp = client.clone();
+					let uncles = sc_consensus_uncles::create_uncles_inherent_data_provider(
+						&*client_clone,
+						parent,
+					)?;
+
+					let timestamp = sp_timestamp::InherentDataProvider::from_system_time();
+
+					let slot =
+						sp_consensus_babe::inherents::InherentDataProvider::from_timestamp_and_slot_duration(
+							*timestamp,
+							slot_duration,
+						);
+
+					Ok((timestamp, slot, uncles, parachain))
+				}
+			},
+			force_authoring,
+			backoff_authoring_blocks,
+			babe_link,
+			can_author_with,
+			block_proposal_slot_portion: babe::SlotProportion::new(2f32 / 3f32),
+			max_block_proposal_slot_portion: None,
+			telemetry: telemetry.as_ref().map(|x| x.handle()),
+		};
+
+		let babe = babe::start_babe(babe_config)?;
+		task_manager.spawn_essential_handle().spawn_blocking("babe", None, babe);
+	}
+
+	// if the node isn't actively participating in consensus then it doesn't
+	// need a keystore, regardless of which protocol we use below.
+	let keystore_opt =
+		if role.is_authority() { Some(keystore_container.sync_keystore()) } else { None };
+
+	// We currently only run the BEEFY gadget on the Rococo and Wococo testnets.
+	if enable_beefy && (chain_spec.is_rococo() || chain_spec.is_wococo() || chain_spec.is_versi()) {
+		let beefy_params = beefy_gadget::BeefyParams {
+			client: client.clone(),
+			backend: backend.clone(),
+			runtime: client.clone(),
+			key_store: keystore_opt.clone(),
+			network: network.clone(),
+			signed_commitment_sender: beefy_links.0,
+			beefy_best_block_sender: beefy_links.1,
+			min_block_delta: if chain_spec.is_wococo() { 4 } else { 8 },
+			prometheus_registry: prometheus_registry.clone(),
+			protocol_name: beefy_protocol_name,
+		};
+
+		let gadget = beefy_gadget::start_beefy_gadget::<_, _, _, _, _>(beefy_params);
+
+		// Wococo's purpose is to be a testbed for BEEFY, so if it fails we'll
+		// bring the node down with it to make sure it is noticed.
+		if chain_spec.is_wococo() {
+			task_manager
+				.spawn_essential_handle()
+				.spawn_blocking("beefy-gadget", None, gadget);
+		} else {
+			task_manager.spawn_handle().spawn_blocking("beefy-gadget", None, gadget);
+		}
+	}
+
+	let config = grandpa::Config {
+		// FIXME substrate#1578 make this available through chainspec
+		gossip_duration: Duration::from_millis(1000),
+		justification_period: 512,
+		name: Some(name),
+		observer_enabled: false,
+		keystore: keystore_opt,
+		local_role: role,
+		telemetry: telemetry.as_ref().map(|x| x.handle()),
+		protocol_name: grandpa_protocol_name,
+	};
+
+	let enable_grandpa = !disable_grandpa;
+	if enable_grandpa {
+		// start the full GRANDPA voter
+		// NOTE: unlike in substrate we are currently running the full
+		// GRANDPA voter protocol for all full nodes (regardless of whether
+		// they're validators or not). at this point the full voter should
+		// provide better guarantees of block and vote data availability than
+		// the observer.
+
+		// add a custom voting rule to temporarily stop voting for new blocks
+		// after the given pause block is finalized and restarting after the
+		// given delay.
+		let builder = grandpa::VotingRulesBuilder::default();
+
+		let voting_rule = match grandpa_pause {
+			Some((block, delay)) => {
+				info!(
+					block_number = %block,
+					delay = %delay,
+					"GRANDPA scheduled voting pause set for block #{} with a duration of {} blocks.",
+					block,
+					delay,
+				);
+
+				builder.add(grandpa_support::PauseAfterBlockFor(block, delay)).build()
+			},
+			None => builder.build(),
+		};
+
+		let grandpa_config = grandpa::GrandpaParams {
+			config,
+			link: link_half,
+			network: network.clone(),
+			voting_rule,
+			prometheus_registry: prometheus_registry.clone(),
+			shared_voter_state,
+			telemetry: telemetry.as_ref().map(|x| x.handle()),
+		};
 
 		task_manager.spawn_essential_handle().spawn_blocking(
-			"authorship_task",
-			run_manual_seal(ManualSealParams {
-				block_import,
-				env,
-				client: client.clone(),
-				pool: transaction_pool.pool().clone(),
-				commands_stream,
-				select_chain,
-				consensus_data_provider: None,
-				create_inherent_data_providers: move |block: H256, ()| {
-					let current_para_block = client_set_aside_for_cidp
-						.number(block)
-						.expect("Header lookup should succeed")
-						.expect("Header passed in as parent should be present in backend.");
-					let author_id = author_id.clone();
-
-					async move {
-						let time = sp_timestamp::InherentDataProvider::from_system_time();
-
-						let mocked_jurisdiction = inherents::MockValidationDataInherentDataProvider {
-							current_para_block,
-							relay_offset: 1000,
-							relay_blocks_per_para_block: 2,
-						};
-
-						let author = nimbus_primitives::InherentDataProvider::<NimbusId>(author_id);
-
-						Ok((time, mocked_jurisdiction, author))
-					}
-				},
-			}),
+			"grandpa-voter",
+			None,
+			grandpa::run_grandpa_voter(grandpa_config)?,
 		);
 	}
 
-	let spawned_requesters = rpc::spawn_tasks(
-		&rpc_config,
-		rpc::SpawnTasksParams {
-			task_manager: &task_manager,
-			client: client.clone(),
-			substrate_backend: backend.clone(),
-			frontier_backend: frontier_backend.clone(),
-			pending_transactions: pending_transactions.clone(),
-			filter_pool: filter_pool.clone(),
-		},
-	);
-
-	let rpc_extensions_builder = {
-		let client = client.clone();
-		let pool = transaction_pool.clone();
-		let backend = backend.clone();
-		let network = network.clone();
-		let pending = pending_transactions;
-		let ethapi_cmd = rpc_config.ethapi.clone();
-		let max_past_logs = rpc_config.max_past_logs;
-
-		let is_ mrevm = config.chain_spec.is_ mrevm();
-		let is_mrevm = config.chain_spec.is_mrevm();
-
-		Box::new(move |deny_unsafe, _| {
-			let transaction_converter: TransactionConverters = if is_ mrevm {
-				TransactionConverters:: mrevm( mrevm_runtime::TransactionConverter)
-			} else if is_mrevm {
-				TransactionConverters::mrevm(mrevm_runtime::TransactionConverter)
-			} else {
-				TransactionConverters::Moonbase(moonbase_runtime::TransactionConverter)
-			};
-
-			let deps = rpc::FullDeps {
-				client: client.clone(),
-				pool: pool.clone(),
-				graph: pool.pool().clone(),
-				deny_unsafe,
-				is_authority: collator,
-				network: network.clone(),
-				pending_transactions: pending.clone(),
-				filter_pool: filter_pool.clone(),
-				ethapi_cmd: ethapi_cmd.clone(),
-				command_sink: command_sink.clone(),
-				frontier_backend: frontier_backend.clone(),
-				backend: backend.clone(),
-				debug_requester: spawned_requesters.debug.clone(),
-				trace_filter_requester: spawned_requesters.trace.clone(),
-				trace_filter_max_count: rpc_config.ethapi_trace_max_count,
-				max_past_logs,
-				transaction_converter,
-			};
-			rpc::create_full(deps, subscription_task_executor.clone())
-		})
-	};
-
-	let _rpc_handlers = sc_service::spawn_tasks(sc_service::SpawnTasksParams {
-		network,
-		client,
-		keystore: keystore_container.sync_keystore(),
-		task_manager: &mut task_manager,
-		transaction_pool,
-		rpc_extensions_builder,
-		on_demand: None,
-		remote_blockchain: None,
-		backend,
-		system_rpc_tx,
-		config,
-		telemetry: None,
-	})?;
-
-	log::info!("Development Service Ready");
-
 	network_starter.start_network();
-	Ok(task_manager)
+
+	Ok(NewFull { task_manager, client, overseer_handle, network, rpc_handlers, backend })
+}
+
+#[cfg(feature = "full-node")]
+macro_rules! chain_ops {
+	($config:expr, $jaeger_agent:expr, $telemetry_worker_handle:expr; $scope:ident, $executor:ident, $variant:ident) => {{
+		let telemetry_worker_handle = $telemetry_worker_handle;
+		let jaeger_agent = $jaeger_agent;
+		let mut config = $config;
+		let basics = new_partial_basics::<$scope::RuntimeApi, $executor>(
+			config,
+			jaeger_agent,
+			telemetry_worker_handle,
+		)?;
+
+		use ::sc_consensus::LongestChain;
+		// use the longest chain selection, since there is no overseer available
+		let chain_selection = LongestChain::new(basics.backend.clone());
+
+		let service::PartialComponents { client, backend, import_queue, task_manager, .. } =
+			new_partial::<$scope::RuntimeApi, $executor, LongestChain<_, Block>>(
+				&mut config,
+				basics,
+				chain_selection,
+			)?;
+		Ok((Arc::new(Client::$variant(client)), backend, import_queue, task_manager))
+	}};
+}
+
+/// Builds a new object suitable for chain operations.
+#[cfg(feature = "full-node")]
+pub fn new_chain_ops(
+	mut config: &mut Configuration,
+	jaeger_agent: Option<std::net::SocketAddr>,
+) -> Result<
+	(
+		Arc<Client>,
+		Arc<FullBackend>,
+		sc_consensus::BasicQueue<Block, PrefixedMemoryDB<BlakeTwo256>>,
+		TaskManager,
+	),
+	Error,
+> {
+	config.keystore = service::config::KeystoreConfig::InMemory;
+
+	let telemetry_worker_handle = None;
+
+	#[cfg(feature = "rococo-native")]
+	if config.chain_spec.is_rococo() ||
+		config.chain_spec.is_wococo() ||
+		config.chain_spec.is_versi()
+	{
+		return chain_ops!(config, jaeger_agent, telemetry_worker_handle; rococo_runtime, RococoExecutorDispatch, Rococo)
+	}
+
+	#[cfg(feature = "kusama-native")]
+	if config.chain_spec.is_kusama() {
+		return chain_ops!(config, jaeger_agent, telemetry_worker_handle; kusama_runtime, KusamaExecutorDispatch, Kusama)
+	}
+
+	#[cfg(feature = "westend-native")]
+	if config.chain_spec.is_westend() {
+		return chain_ops!(config, jaeger_agent, telemetry_worker_handle; westend_runtime, WestendExecutorDispatch, Westend)
+	}
+
+	#[cfg(feature = "moonrabbit-native")]
+		{
+			return chain_ops!(config, jaeger_agent, telemetry_worker_handle; moonrabbit_runtime, moonrabbitExecutorDispatch, moonrabbit)
+		}
+	#[cfg(not(feature = "moonrabbit-native"))]
+		Err(Error::NoRuntime)
+}
+
+/// Build a full node.
+///
+/// The actual "flavor", aka if it will use `moonrabbit`, `Rococo` or `Kusama` is determined based on
+/// [`IdentifyVariant`] using the chain spec.
+///
+/// `overseer_enable_anyways` always enables the overseer, based on the provided `OverseerGenerator`,
+/// regardless of the role the node has. The relay chain selection (longest or disputes-aware) is
+/// still determined based on the role of the node. Likewise for authority discovery.
+#[cfg(feature = "full-node")]
+pub fn build_full(
+	config: Configuration,
+	is_collator: IsCollator,
+	grandpa_pause: Option<(u32, u32)>,
+	enable_beefy: bool,
+	jaeger_agent: Option<std::net::SocketAddr>,
+	telemetry_worker_handle: Option<TelemetryWorkerHandle>,
+	overseer_enable_anyways: bool,
+	overseer_gen: impl OverseerGen,
+) -> Result<NewFull<Client>, Error> {
+	#[cfg(feature = "rococo-native")]
+	if config.chain_spec.is_rococo() ||
+		config.chain_spec.is_wococo() ||
+		config.chain_spec.is_versi()
+	{
+		return new_full::<rococo_runtime::RuntimeApi, RococoExecutorDispatch, _>(
+			config,
+			is_collator,
+			grandpa_pause,
+			enable_beefy,
+			jaeger_agent,
+			telemetry_worker_handle,
+			None,
+			overseer_enable_anyways,
+			overseer_gen,
+		)
+			.map(|full| full.with_client(Client::Rococo))
+	}
+
+	#[cfg(feature = "kusama-native")]
+	if config.chain_spec.is_kusama() {
+		return new_full::<kusama_runtime::RuntimeApi, KusamaExecutorDispatch, _>(
+			config,
+			is_collator,
+			grandpa_pause,
+			enable_beefy,
+			jaeger_agent,
+			telemetry_worker_handle,
+			None,
+			overseer_enable_anyways,
+			overseer_gen,
+		)
+			.map(|full| full.with_client(Client::Kusama))
+	}
+
+	#[cfg(feature = "westend-native")]
+	if config.chain_spec.is_westend() {
+		return new_full::<westend_runtime::RuntimeApi, WestendExecutorDispatch, _>(
+			config,
+			is_collator,
+			grandpa_pause,
+			enable_beefy,
+			jaeger_agent,
+			telemetry_worker_handle,
+			None,
+			overseer_enable_anyways,
+			overseer_gen,
+		)
+			.map(|full| full.with_client(Client::Westend))
+	}
+
+	#[cfg(feature = "moonrabbit-native")]
+		{
+			return new_full::<moonrabbit_runtime::RuntimeApi, moonrabbitExecutorDispatch, _>(
+				config,
+				is_collator,
+				grandpa_pause,
+				enable_beefy,
+				jaeger_agent,
+				telemetry_worker_handle,
+				None,
+				overseer_enable_anyways,
+				overseer_gen,
+			)
+				.map(|full| full.with_client(Client::moonrabbit))
+		}
+
+	#[cfg(not(feature = "moonrabbit-native"))]
+		Err(Error::NoRuntime)
 }
